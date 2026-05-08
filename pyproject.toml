@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attackmap-analyzer-dotnet"
+version = "0.1.0"
+description = "C# / .NET (ASP.NET Core) ecosystem analyzer plugin for AttackMap (minimal APIs, attribute routing, EF Core, Identity, JwtBearer)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+  {name = "AttackMap Contributors"}
+]
+dependencies = [
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+core = [
+  "attackmap>=0.1.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.entry-points."attackmap.analyzers"]
+dotnet = "attackmap_analyzer_dotnet:DotnetAnalyzer"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
