@@ -1,5 +1,10 @@
 # attackmap-analyzer-dotnet
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 C# / .NET (ASP.NET Core) ecosystem analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 This analyzer extracts structured signals from .NET solutions and projects:
