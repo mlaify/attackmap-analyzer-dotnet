@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Routes carry their effective auth in the core contract (AttackMap#256): `Route.auth` (`required` / `anonymous` / `unknown`), `guards` and `guard_evidence`. AttackMap ≥ 0.6 uses them instead of its ±40-line auth-hint window, so an `[AllowAnonymous]` action no longer inherits its neighbour's `[Authorize]`. The `aspnet_authorize:*` / `aspnet_allow_anonymous:*` hints are kept for one release for older cores, which ignore the new fields.
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk.fs` helpers
