@@ -17,9 +17,19 @@ Coverage (v0.1):
 - Entrypoints: WebApplication.CreateBuilder + .Run(), Host.CreateDefaultBuilder
 - Service hints: <RootNamespace> / <AssemblyName> from .csproj
 
-Class-level [Route("api/[controller]")] is parsed and the `[controller]` token
-is substituted with the controller class name (minus the "Controller" suffix)
-to produce the final route path.
+Routes (see `routes.py`): attribute routing with ASP.NET template semantics
+(absolute `/` and `~/` templates, `[controller]`/`[action]`/`[area]` tokens,
+class prefixes scoped to the class body), minimal APIs with nested `MapGroup`
+prefixes, `MapHub`, `MapControllerRoute` and Razor Pages `@page`. Every path
+starts with `/`.
+
+Per-route auth: each route's effective state (`[Authorize]`/`[AllowAnonymous]`,
+`.RequireAuthorization()`/`.AllowAnonymous()`, fallback policies) is computed.
+Core has no auth field on `Route` yet (mlaify/AttackMap#256); it attributes
+`auth_hints` to routes by file and line, so a route that requires auth gets an
+`aspnet_authorize:<METHOD> <path>` auth hint on its own line, and an
+explicitly anonymous route gets an `aspnet_allow_anonymous:<METHOD> <path>`
+entrypoint hint and no auth hint.
 """
 
 from __future__ import annotations
@@ -36,14 +46,18 @@ from .contracts import (
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    ProtocolHint,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+from .routes import ANONYMOUS, REQUIRED, UNKNOWN, RouteSpec, extract_cs_routes, extract_razor_page
 
 CODE_SUFFIXES = {".cs"}
-CONFIG_FILES = {"appsettings.json", "appsettings.Development.json"}
+RAZOR_SUFFIXES = {".cshtml"}
+# appsettings.json, appsettings.Development.json, appsettings.Production.json, ...
+CONFIG_FILE_RE = re.compile(r"^appsettings(?:\.[\w-]+)?\.json$", re.IGNORECASE)
 PROJECT_FILES = {".csproj", ".fsproj", ".sln"}
 # .NET-specific directories on top of the SDK defaults. Matched against
 # directory names inside the repo only (mlaify/AttackMap#253).
@@ -52,31 +66,6 @@ _SNIPPET_MAX_CHARS = 160
 
 
 # ---------- Patterns ----------
-
-# Minimal APIs: app.MapGet("/x", handler), app.MapPost(...), etc.
-MINIMAL_API_PATTERN = re.compile(
-    r'\b\w+\.Map(Get|Post|Put|Delete|Patch|Head|Options)\s*\(\s*"([^"]+)"',
-)
-# app.MapMethods("/x", new[] { "GET", "POST" }, handler)
-MINIMAL_API_METHODS_PATTERN = re.compile(
-    r'\b\w+\.MapMethods\s*\(\s*"([^"]+)"\s*,\s*new\[\]\s*\{\s*([^}]+)\s*\}',
-)
-
-# Attribute routing on controllers
-HTTP_ATTRIBUTE_PATTERN = re.compile(
-    r'\[\s*Http(Get|Post|Put|Delete|Patch|Head|Options)\s*(?:\(\s*"([^"]*)"\s*\))?\s*\]',
-)
-# Class-level [Route("api/[controller]")] or [Route("api/users")]
-# `[^\{]*?` allows other attributes ([ApiController], [Authorize], etc.) between
-# the [Route] and the class declaration, but not a class body start `{`.
-CLASS_ROUTE_ATTRIBUTE_PATTERN = re.compile(
-    r'\[\s*Route\s*\(\s*"([^"]+)"\s*\)\s*\][^\{]*?\bclass\s+(\w+)',
-    re.DOTALL,
-)
-# Method-level [Route("/x")] (less common, but valid)
-METHOD_ROUTE_ATTRIBUTE_PATTERN = re.compile(
-    r'\[\s*Route\s*\(\s*"([^"]+)"\s*\)\s*\]',
-)
 
 # External HTTP calls. The receiver-name regex is intentionally permissive (any
 # identifier can be a HttpClient field, often `_httpClient`); we anchor on the
@@ -113,7 +102,6 @@ AUTH_PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
     (re.compile(r'\bPasswordHasher<|\bIPasswordHasher\b'), "password_hasher", 0.85),
     (re.compile(r'\bBCrypt\.Net\b|\bBCryptPasswordHasher\b'), "bcrypt", 0.9),
     (re.compile(r'\bArgon2\b'), "argon2", 0.9),
-    (re.compile(r'\[\s*Authorize\b'), "authorize_attribute", 0.85),
     (re.compile(r'\.AddAuthorization\s*\('), "authorization_setup", 0.85),
     (re.compile(r'\bDuende\.IdentityServer\b|\bIdentityServer4\b'), "identityserver", 0.85),
     (re.compile(r'\bAuthorization\b'), "authorization_header", 0.6),
@@ -150,10 +138,14 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
         r'\b\w+(?:\.\w+)?\s*\[\s*"([A-Za-z0-9_:.]*(?:secret|token|key|password|pass|pwd)[A-Za-z0-9_:.]*)"',
         re.IGNORECASE,
     ),
-    re.compile(
-        r'\bGetConnectionString\s*\(\s*"([^"]+)"',
-    ),
 ]
+# GetConnectionString("Default") names a connection string; it isn't a secret
+# (#2). Literal passwords in appsettings*.json ConnectionStrings are reported
+# instead, see _extract_config_secrets.
+_CONNECTION_STRINGS_RE = re.compile(r'"ConnectionStrings"\s*:\s*\{')
+_CONNECTION_ENTRY_RE = re.compile(r'"([^"\\]+)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_CONNECTION_PASSWORD_RE = re.compile(r"(?:^|;)\s*(?:password|pwd)\s*=\s*([^;]*)", re.IGNORECASE)
+_PLACEHOLDER_RE = re.compile(r"^(?:\$?\{.*\}|<.*>|%.*%|#\{.*\}#?|__\w+__|\*+)$")
 
 
 # Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
@@ -171,49 +163,13 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
-def _join_paths(prefix: str, suffix: str) -> str:
-    p = prefix.strip()
-    s = suffix.strip()
-    if not p:
-        return s or "/"
-    if not s:
-        return p or "/"
-    if p == "/":
-        return s if s.startswith("/") else "/" + s
-    if s == "/":
-        return p
-    return p.rstrip("/") + "/" + s.lstrip("/")
-
-
-def _substitute_controller_token(route_template: str, controller_name: str) -> str:
-    """Replace [controller] in route template with controller class name minus 'Controller'."""
-    name = controller_name
-    if name.endswith("Controller"):
-        name = name[: -len("Controller")]
-    return route_template.replace("[controller]", name).replace("[Controller]", name)
-
-
-def _class_routes_in_file(content: str) -> list[tuple[int, str, str]]:
-    """Return [(start_offset, route_template_after_substitution, controller_class), ...]
-    for every class-level [Route(...)] annotation in the file.
-    """
-    results: list[tuple[int, str, str]] = []
-    for match in CLASS_ROUTE_ATTRIBUTE_PATTERN.finditer(content):
-        template, class_name = match.group(1), match.group(2)
-        substituted = _substitute_controller_token(template, class_name)
-        results.append((match.start(), substituted, class_name))
-    return results
-
-
-def _active_class_route(prefixes: list[tuple[int, str, str]], offset: int) -> str:
-    """The most recent class-level [Route] preceding the offset, post-substitution."""
-    active = ""
-    for start, template, _ in prefixes:
-        if start < offset:
-            active = template
-        else:
-            break
-    return active
+def _connection_password(value: str) -> bool:
+    """True when a connection string carries a literal, non-placeholder password."""
+    m = _CONNECTION_PASSWORD_RE.search(value)
+    if m is None:
+        return False
+    password = m.group(1).strip().strip("'\"")
+    return bool(password) and _PLACEHOLDER_RE.match(password) is None
 
 
 def _extract_csproj_meta(csproj_path: Path, root: Path | None = None) -> tuple[str | None, str | None]:
@@ -269,17 +225,33 @@ class DotnetAnalyzer:
             if assembly:
                 self._append_unique_service(result, f"assembly:{assembly}", relative)
 
-        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+        pending: list[tuple[RouteSpec, str, str]] = []  # (route, file, content)
+        defaults = {"controllers": False, "razor": False, "fallback": False}
+
+        for file_path in iter_repo_files(
+            root, suffixes=CODE_SUFFIXES | RAZOR_SUFFIXES | {".json"}, skip_dirs=SKIP_DIRS
+        ):
+            suffix = file_path.suffix.lower()
+            if suffix == ".json" and not CONFIG_FILE_RE.match(file_path.name):
+                continue
             content = read_source(file_path, root=root)
             if content is None:
                 continue
 
             result.files_scanned += 1
+            relative = rel(file_path, root)
+            if suffix == ".json":
+                self._extract_config_secrets(content, relative, result)
+                continue
             if "csharp" not in result.languages:
                 result.languages.append("csharp")
+            if suffix in RAZOR_SUFFIXES:
+                spec = extract_razor_page(content, relative)
+                if spec is not None:
+                    pending.append((spec, relative, content))
+                continue
 
-            relative = rel(file_path, root)
-            self._extract_routes(content, relative, result)
+            self._extract_routes(content, relative, result, pending, defaults)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
             self._extract_secrets(content, relative, result)
@@ -288,49 +260,84 @@ class DotnetAnalyzer:
             self._extract_entrypoints(content, relative, result)
             self._infer_service_role(content, relative, result)
 
+        self._emit_routes(pending, defaults, result)
         result.languages.sort()
         return result
 
     # ---------- Extractors ----------
 
-    def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
-        # Minimal APIs: app.MapGet("/x", handler), etc.
-        for match in MINIMAL_API_PATTERN.finditer(content):
-            method, path = match.group(1).upper(), match.group(2)
-            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+    def _extract_routes(
+        self,
+        content: str,
+        relative: str,
+        result: ScanResult,
+        pending: list[tuple[RouteSpec, str, str]],
+        defaults: dict[str, bool],
+    ) -> None:
+        found = extract_cs_routes(content)
+        pending.extend((spec, relative, content) for spec in found.routes)
+        defaults["controllers"] |= found.controllers_require_auth
+        defaults["razor"] |= found.razor_pages_require_auth
+        defaults["fallback"] |= found.fallback_policy_requires_auth
+        # An [Authorize] that guards no extracted route (a class without
+        # actions, a Razor PageModel, a hub) stays a file-level hint.
+        for offset in found.unattached_authorize:
+            self._append_unique_auth(
+                result, "authorize_attribute", relative,
+                line_of(content, offset), _line_snippet(content, offset), 0.85,
+            )
+        for hint, offset in found.protocol_hints:
+            self._append_unique_protocol(
+                result, hint, relative, line_of(content, offset), _line_snippet(content, offset),
+            )
 
-        # Minimal APIs: app.MapMethods("/x", new[] { "GET", "POST" }, handler)
-        for match in MINIMAL_API_METHODS_PATTERN.finditer(content):
-            path = match.group(1)
-            verbs_raw = match.group(2)
-            verbs = re.findall(r'"([A-Za-z]+)"', verbs_raw)
-            line = line_of(content, match.start())
-            for verb in verbs:
-                self._append_unique_route(result, path, verb.upper(), relative, line)
+    def _emit_routes(
+        self,
+        pending: list[tuple[RouteSpec, str, str]],
+        defaults: dict[str, bool],
+        result: ScanResult,
+    ) -> None:
+        """Append routes plus their per-route auth signals.
 
-        # Attribute routing: class-level [Route("api/[controller]")] + method-level [HttpGet]
-        class_routes = _class_routes_in_file(content)
-        for match in HTTP_ATTRIBUTE_PATTERN.finditer(content):
-            method = match.group(1).upper()
-            method_path = match.group(2) or ""
-            prefix = _active_class_route(class_routes, match.start())
-            full_path = _join_paths(prefix, method_path) if prefix else (method_path or "/")
-            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
-
-        # Method-level [Route("/x")] — emit with method ANY (rare but legal)
-        for match in METHOD_ROUTE_ATTRIBUTE_PATTERN.finditer(content):
-            # Skip class-level routes — those are handled as prefixes above.
-            if any(start == match.start() for start, _, _ in class_routes):
+        Runs after every file is read, because a fallback policy or
+        `MapControllers().RequireAuthorization()` in Program.cs changes the
+        default for routes declared in other files.
+        """
+        for spec, relative, content in pending:
+            if spec.auth == UNKNOWN:
+                if defaults["fallback"]:
+                    spec.auth, spec.auth_evidence = REQUIRED, "authorization fallback policy"
+                elif defaults["controllers"] and spec.kind in ("attribute", "conventional"):
+                    spec.auth, spec.auth_evidence = REQUIRED, "MapControllers().RequireAuthorization()"
+                elif defaults["razor"] and spec.kind == "razor":
+                    spec.auth, spec.auth_evidence = REQUIRED, "MapRazorPages().RequireAuthorization()"
+            line = line_of(content, spec.offset)
+            if not self._append_unique_route(result, spec.path, spec.method, relative, line):
                 continue
-            method_path = match.group(1)
-            prefix = _active_class_route(class_routes, match.start())
-            # Skip if the [HttpX(...)] attribute regex already would have matched this
-            # (i.e. the regex is part of an [HttpGet("/x")] form). We detect that by
-            # checking whether this offset's match overlaps with any HTTP_ATTRIBUTE_PATTERN
-            # match — but cheaper: Routes inside [Http*] aren't matched by METHOD_ROUTE_ATTRIBUTE
-            # because the latter requires "[Route(" specifically.
-            full_path = _join_paths(prefix, method_path) if prefix else (method_path or "/")
-            self._append_unique_route(result, full_path, "ANY", relative, line_of(content, match.start()))
+            label = f"{spec.method} {spec.path}"
+            evidence = f"{label}: {spec.auth_evidence}" if spec.auth_evidence else _line_snippet(content, spec.offset)
+            if spec.auth == REQUIRED:
+                self._append_unique_auth(result, f"aspnet_authorize:{label}", relative, line, evidence, 0.9)
+            elif spec.auth == ANONYMOUS:
+                self._append_unique_entrypoint(result, f"aspnet_allow_anonymous:{label}", relative, line, evidence)
+
+    def _extract_config_secrets(self, content: str, relative: str, result: ScanResult) -> None:
+        """Literal passwords in an appsettings*.json `ConnectionStrings` section."""
+        section = _CONNECTION_STRINGS_RE.search(content)
+        if section is None:
+            return
+        end = content.find("}", section.end())
+        body_end = len(content) if end == -1 else end
+        for entry in _CONNECTION_ENTRY_RE.finditer(content, section.end(), body_end):
+            if not _connection_password(entry.group(2)):
+                continue
+            # The evidence names the connection string, never the value.
+            self._append_unique_secret(
+                result, "connection_string_password", relative,
+                line_of(content, entry.start()),
+                f"ConnectionStrings:{entry.group(1)} contains a literal Password=",
+                kind="config_literal",
+            )
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -415,11 +422,12 @@ class DotnetAnalyzer:
     # ---------- Append helpers ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> None:
+    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> bool:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
-            return
+            return False
         result.routes.append(Route(path=path, method=method, file=file, line=line))
+        return True
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
@@ -436,11 +444,27 @@ class DotnetAnalyzer:
         result.auth_hints.append(AuthHint(hint=hint, file=file, line=line, evidence_text=evidence, confidence=confidence))
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str, line: int | None, evidence: str | None) -> None:
-        key = (name, file)
-        if any((item.name, item.file) == key for item in result.secret_hints):
+    def _append_unique_secret(
+        result: ScanResult, name: str, file: str, line: int | None, evidence: str | None, kind: str = "env_reference"
+    ) -> None:
+        # Env references dedup per file; config literals per line, so two
+        # connection strings with passwords in one file both show up.
+        if kind == "env_reference":
+            duplicate = any((item.name, item.file) == (name, file) for item in result.secret_hints)
+        else:
+            duplicate = any((item.name, item.file, item.line) == (name, file, line) for item in result.secret_hints)
+        if duplicate:
             return
-        result.secret_hints.append(SecretHint(name=name, file=file, line=line, evidence_text=evidence, confidence=0.85))
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=evidence, confidence=0.85, kind=kind)
+        )
+
+    @staticmethod
+    def _append_unique_protocol(result: ScanResult, hint: str, file: str, line: int | None, evidence: str | None) -> None:
+        key = (hint, file)
+        if any((item.hint, item.file) == key for item in result.protocol_hints):
+            return
+        result.protocol_hints.append(ProtocolHint(hint=hint, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
     def _append_unique_external(result: ScanResult, target: str, file: str, line: int | None, evidence: str | None) -> None:
