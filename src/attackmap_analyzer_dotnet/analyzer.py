@@ -27,6 +27,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -43,17 +45,9 @@ from .contracts import (
 CODE_SUFFIXES = {".cs"}
 CONFIG_FILES = {"appsettings.json", "appsettings.Development.json"}
 PROJECT_FILES = {".csproj", ".fsproj", ".sln"}
-SKIP_DIRS = {
-    "bin",
-    "obj",
-    ".vs",
-    ".idea",
-    ".git",
-    "node_modules",
-    "packages",
-    "TestResults",
-    "publish",
-}
+# .NET-specific directories on top of the SDK defaults. Matched against
+# directory names inside the repo only (mlaify/AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {"bin", "obj", ".vs", ".idea", "packages", "TestResults", "publish"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -162,12 +156,10 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
+# Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
+# splits on "\n" only, so it stays consistent with line_of() on files that
+# contain form feeds or other str.splitlines() separators, and it costs
+# O(line) per match instead of O(file).
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
@@ -224,11 +216,10 @@ def _active_class_route(prefixes: list[tuple[int, str, str]], offset: int) -> st
     return active
 
 
-def _extract_csproj_meta(csproj_path: Path) -> tuple[str | None, str | None]:
+def _extract_csproj_meta(csproj_path: Path, root: Path | None = None) -> tuple[str | None, str | None]:
     """Return (root_namespace, assembly_name) from a .csproj file."""
-    try:
-        text = csproj_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+    text = read_source(csproj_path, root=root)
+    if text is None:
         return None, None
     rn = re.search(r"<RootNamespace>([^<]+)</RootNamespace>", text)
     an = re.search(r"<AssemblyName>([^<]+)</AssemblyName>", text)
@@ -260,16 +251,8 @@ class DotnetAnalyzer:
         if not root.exists() or not root.is_dir():
             return False
         # Project / solution markers
-        for path in root.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if not path.is_file():
-                continue
-            if path.suffix in {".csproj", ".sln", ".fsproj"}:
-                return True
-            if path.suffix in CODE_SUFFIXES:
-                return True
-        return False
+        markers = CODE_SUFFIXES | PROJECT_FILES
+        return next(iter_repo_files(root, suffixes=markers, skip_dirs=SKIP_DIRS), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -278,34 +261,24 @@ class DotnetAnalyzer:
             return result
 
         # Service-name hints from .csproj files
-        for csproj in root.rglob("*.csproj"):
-            if any(part in SKIP_DIRS for part in csproj.parts):
-                continue
-            root_ns, assembly = _extract_csproj_meta(csproj)
-            relative = str(csproj.relative_to(root))
+        for csproj in iter_repo_files(root, suffixes={".csproj"}, skip_dirs=SKIP_DIRS):
+            root_ns, assembly = _extract_csproj_meta(csproj, root)
+            relative = rel(csproj, root)
             if root_ns:
                 self._append_unique_service(result, f"namespace:{root_ns}", relative)
             if assembly:
                 self._append_unique_service(result, f"assembly:{assembly}", relative)
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-            if file_path.suffix not in CODE_SUFFIXES:
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path, root=root)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "csharp" not in result.languages:
                 result.languages.append("csharp")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -324,14 +297,14 @@ class DotnetAnalyzer:
         # Minimal APIs: app.MapGet("/x", handler), etc.
         for match in MINIMAL_API_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
-            self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Minimal APIs: app.MapMethods("/x", new[] { "GET", "POST" }, handler)
         for match in MINIMAL_API_METHODS_PATTERN.finditer(content):
             path = match.group(1)
             verbs_raw = match.group(2)
             verbs = re.findall(r'"([A-Za-z]+)"', verbs_raw)
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             for verb in verbs:
                 self._append_unique_route(result, path, verb.upper(), relative, line)
 
@@ -342,7 +315,7 @@ class DotnetAnalyzer:
             method_path = match.group(2) or ""
             prefix = _active_class_route(class_routes, match.start())
             full_path = _join_paths(prefix, method_path) if prefix else (method_path or "/")
-            self._append_unique_route(result, full_path, method, relative, _line_of(content, match.start()))
+            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
 
         # Method-level [Route("/x")] — emit with method ANY (rare but legal)
         for match in METHOD_ROUTE_ATTRIBUTE_PATTERN.finditer(content):
@@ -357,7 +330,7 @@ class DotnetAnalyzer:
             # match — but cheaper: Routes inside [Http*] aren't matched by METHOD_ROUTE_ATTRIBUTE
             # because the latter requires "[Route(" specifically.
             full_path = _join_paths(prefix, method_path) if prefix else (method_path or "/")
-            self._append_unique_route(result, full_path, "ANY", relative, _line_of(content, match.start()))
+            self._append_unique_route(result, full_path, "ANY", relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -366,7 +339,7 @@ class DotnetAnalyzer:
                 continue
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -377,7 +350,7 @@ class DotnetAnalyzer:
                 continue
             self._append_unique_auth(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -389,7 +362,7 @@ class DotnetAnalyzer:
                 name = groups[0] if groups and groups[0] else "unknown"
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -401,7 +374,7 @@ class DotnetAnalyzer:
                     continue
                 self._append_unique_external(
                     result, target, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -412,7 +385,7 @@ class DotnetAnalyzer:
                 continue
             self._append_unique_framework(
                 result, name, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -423,7 +396,7 @@ class DotnetAnalyzer:
                 continue
             self._append_unique_entrypoint(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
