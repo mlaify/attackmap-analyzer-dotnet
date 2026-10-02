@@ -312,7 +312,14 @@ class DotnetAnalyzer:
                 elif defaults["razor"] and spec.kind == "razor":
                     spec.auth, spec.auth_evidence = REQUIRED, "MapRazorPages().RequireAuthorization()"
             line = line_of(content, spec.offset)
-            if not self._append_unique_route(result, spec.path, spec.method, relative, line):
+            # Route.auth / guards / guard_evidence (AttackMap#256): core trusts
+            # this over its own resolution. An older core ignores the fields;
+            # the hints below stay for one release for those cores.
+            guards = [spec.auth_evidence or "[Authorize]"] if spec.auth == REQUIRED else []
+            if not self._append_unique_route(
+                result, spec.path, spec.method, relative, line,
+                auth=spec.auth, guards=guards, guard_evidence=spec.auth_evidence,
+            ):
                 continue
             label = f"{spec.method} {spec.path}"
             evidence = f"{label}: {spec.auth_evidence}" if spec.auth_evidence else _line_snippet(content, spec.offset)
@@ -422,11 +429,26 @@ class DotnetAnalyzer:
     # ---------- Append helpers ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> bool:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int | None,
+        *,
+        auth: str = UNKNOWN,
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> bool:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return False
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        result.routes.append(
+            Route(
+                path=path, method=method, file=file, line=line,
+                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+            )
+        )
         return True
 
     @staticmethod

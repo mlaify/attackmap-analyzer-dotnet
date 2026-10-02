@@ -747,3 +747,18 @@ def test_appsettings_connection_string_password_is_a_secret_without_its_key_name
     assert not any(s.name in {"Default", "Main", "Cache"} for s in result.secret_hints)
     assert all("Hunter2" not in (s.evidence_text or "") for s in result.secret_hints)
     assert all(s.kind == "config_literal" for s in result.secret_hints)
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+
+def test_routes_carry_declared_auth_state(tmp_path: Path) -> None:
+    (tmp_path / "UsersController.cs").write_text(_USERS_CONTROLLER, encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    by_route = {f"{r.method} {r.path}": r for r in result.routes}
+    guarded = by_route["GET /api/Users/{id}"]
+    assert getattr(guarded, "auth", None) == "required"
+    assert guarded.guards and guarded.guard_evidence
+    signup = by_route["POST /public/signup"]
+    assert signup.auth == "anonymous" and signup.guards == []
+    assert {r.auth for r in result.routes} <= {"required", "anonymous", "unknown"}
