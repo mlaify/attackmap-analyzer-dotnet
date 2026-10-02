@@ -102,9 +102,9 @@ def test_attribute_routing_with_class_route_and_controller_token(tmp_path: Path)
     )
     result = DotnetAnalyzer().analyze(tmp_path)
     pairs = sorted({(r.path, r.method) for r in result.routes})
-    assert ("api/Users/{id:int}", "GET") in pairs
-    assert ("api/Users", "POST") in pairs
-    assert ("api/Users/{id:int}", "DELETE") in pairs
+    assert ("/api/Users/{id:int}", "GET") in pairs
+    assert ("/api/Users", "POST") in pairs
+    assert ("/api/Users/{id:int}", "DELETE") in pairs
 
 
 def test_attribute_routing_with_explicit_class_path(tmp_path: Path) -> None:
@@ -126,8 +126,8 @@ def test_attribute_routing_with_explicit_class_path(tmp_path: Path) -> None:
     )
     result = DotnetAnalyzer().analyze(tmp_path)
     pairs = {(r.path, r.method) for r in result.routes}
-    assert ("api/orders/v2", "GET") in pairs
-    assert ("api/orders/v2/refund", "POST") in pairs
+    assert ("/api/orders/v2", "GET") in pairs
+    assert ("/api/orders/v2/refund", "POST") in pairs
 
 
 def test_attribute_routing_handles_two_controllers_in_one_file(tmp_path: Path) -> None:
@@ -150,10 +150,10 @@ def test_attribute_routing_handles_two_controllers_in_one_file(tmp_path: Path) -
     )
     result = DotnetAnalyzer().analyze(tmp_path)
     pairs = {(r.path, r.method) for r in result.routes}
-    assert ("api/a/x", "GET") in pairs
-    assert ("api/b/y", "GET") in pairs
-    assert ("api/a/y", "GET") not in pairs
-    assert ("api/b/x", "GET") not in pairs
+    assert ("/api/a/x", "GET") in pairs
+    assert ("/api/b/y", "GET") in pairs
+    assert ("/api/a/y", "GET") not in pairs
+    assert ("/api/b/x", "GET") not in pairs
 
 
 # ---------- Databases ----------
@@ -278,18 +278,21 @@ def test_iconfiguration_secret_keys(tmp_path: Path) -> None:
     assert any("apikey" in n.replace(":", "") for n in names_lower)
 
 
-def test_connection_string_extracted(tmp_path: Path) -> None:
+def test_get_connection_string_is_not_a_secret(tmp_path: Path) -> None:
+    """GetConnectionString("X") names a connection string; it isn't a secret (#2)."""
     (tmp_path / "Cfg.cs").write_text(
         'public class Startup {\n'
         '    public void Configure(IConfiguration cfg) {\n'
         '        var conn = cfg.GetConnectionString("DefaultConnection");\n'
+        '        var other = cfg.GetConnectionString("Default");\n'
         '    }\n'
         '}\n',
         encoding="utf-8",
     )
     result = DotnetAnalyzer().analyze(tmp_path)
     names = {s.name for s in result.secret_hints}
-    assert "DefaultConnection" in names
+    assert "DefaultConnection" not in names
+    assert "Default" not in names
 
 
 # ---------- External calls ----------
@@ -406,12 +409,15 @@ def test_full_aspnetcore_service_signal_set(tmp_path: Path) -> None:
 
     pairs = {(r.path, r.method) for r in result.routes}
     assert ("/health", "GET") in pairs
-    assert ("api/Orders/{id:int}", "GET") in pairs
-    assert ("api/Orders/admin/refund", "POST") in pairs
+    assert ("/api/Orders/{id:int}", "GET") in pairs
+    assert ("/api/Orders/admin/refund", "POST") in pairs
 
     assert any(d.kind == "postgresql" for d in result.databases)
     assert any(h.hint == "jwt" for h in result.auth_hints)
-    assert any(h.hint == "authorize_attribute" for h in result.auth_hints)
+    # The controller's [Authorize] is now attributed to each of its routes (#2).
+    auth = {h.hint: h.line for h in result.auth_hints}
+    assert auth["aspnet_authorize:GET /api/Orders/{id:int}"] == 9
+    assert auth["aspnet_authorize:POST /api/Orders/admin/refund"] == 12
     assert "STRIPE_API_KEY" in {s.name for s in result.secret_hints}
     assert any(e.target == "https://api.stripe.com/v1/charges" for e in result.external_calls)
     assert any(f.hint == "aspnetcore" for f in result.framework_hints)
@@ -464,3 +470,280 @@ def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
     result = analyzer.analyze(repo)
     assert result.files_scanned == 0
     assert result.routes == []
+
+
+# ---------- Route templates, groups and per-route auth (#2) ----------
+
+
+def _pairs(result) -> set[tuple[str, str]]:
+    return {(r.method, r.path) for r in result.routes}
+
+
+def _required(result) -> set[str]:
+    return {h.hint.split(":", 1)[1] for h in result.auth_hints if h.hint.startswith("aspnet_authorize:")}
+
+
+def _anonymous(result) -> set[str]:
+    return {h.hint.split(":", 1)[1] for h in result.entrypoint_hints if h.hint.startswith("aspnet_allow_anonymous:")}
+
+
+_USERS_CONTROLLER = (
+    'using Microsoft.AspNetCore.Authorization;\n'
+    'using Microsoft.AspNetCore.Mvc;\n'
+    '\n'
+    'namespace Demo.Api;\n'
+    '\n'
+    '[ApiController]\n'
+    '[Route("api/[controller]")]\n'
+    '[Authorize]\n'
+    'public class UsersController : ControllerBase\n'
+    '{\n'
+    '    [HttpGet("{id}", Name = "GetUser")]\n'
+    '    public IActionResult Get(int id) => Ok();\n'
+    '\n'
+    '    [HttpPost("/public/signup")]\n'
+    '    [AllowAnonymous]\n'
+    '    public IActionResult Signup() => Ok();\n'
+    '\n'
+    '    [HttpGet("[action]")]\n'
+    '    public async Task<IActionResult> SearchAsync(string q) => Ok();\n'
+    '\n'
+    '    [HttpGet("~/health"), AllowAnonymous]\n'
+    '    public IActionResult Health() => Ok();\n'
+    '\n'
+    '    [HttpDelete(template: "{id}", Order = 1)]\n'
+    '    public IActionResult Delete(int id) => Ok();\n'
+    '}\n'
+    '\n'
+    'public class Helpers\n'
+    '{\n'
+    '    [HttpGet("helper")]\n'
+    '    public IActionResult Helper() => null;\n'
+    '}\n'
+)
+
+
+def test_attribute_named_args_absolute_templates_and_action_token(tmp_path: Path) -> None:
+    (tmp_path / "UsersController.cs").write_text(_USERS_CONTROLLER, encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _pairs(result) == {
+        ("GET", "/api/Users/{id}"),          # named arg after the template
+        ("POST", "/public/signup"),          # `/` template is absolute
+        ("GET", "/api/Users/Search"),        # [action], Async suffix dropped
+        ("GET", "/health"),                  # `~/` template is absolute
+        ("DELETE", "/api/Users/{id}"),       # template: named argument
+        ("GET", "/helper"),                  # second class has no [Route]
+    }
+    lines = {(r.method, r.path): r.line for r in result.routes}
+    assert lines[("GET", "/api/Users/{id}")] == 11
+    assert lines[("POST", "/public/signup")] == 14
+
+
+def test_attribute_effective_auth_allow_anonymous_overrides_class_authorize(tmp_path: Path) -> None:
+    (tmp_path / "UsersController.cs").write_text(_USERS_CONTROLLER, encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _required(result) == {"GET /api/Users/{id}", "GET /api/Users/Search", "DELETE /api/Users/{id}"}
+    assert _anonymous(result) == {"POST /public/signup", "GET /health"}
+    # The required hints sit on their own route lines, where core attributes them.
+    hint_lines = {h.hint: h.line for h in result.auth_hints}
+    assert hint_lines["aspnet_authorize:GET /api/Users/{id}"] == 11
+    # [Authorize] is now per-route, not a file-level hint.
+    assert not any(h.hint == "authorize_attribute" for h in result.auth_hints)
+
+
+def test_combined_attribute_list_and_method_level_authorize(tmp_path: Path) -> None:
+    (tmp_path / "OrdersController.cs").write_text(
+        'using Microsoft.AspNetCore.Mvc;\n'
+        '[Route("api/orders")]\n'
+        'public class OrdersController : ControllerBase\n'
+        '{\n'
+        '    [HttpGet, Authorize(Roles = "Admin")]\n'
+        '    public IActionResult List() => Ok();\n'
+        '\n'
+        '    [HttpPost]\n'
+        '    public IActionResult Create() => Ok();\n'
+        '\n'
+        '    [Route("export")]\n'
+        '    public IActionResult Export() => Ok();\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _pairs(result) == {("GET", "/api/orders"), ("POST", "/api/orders"), ("ANY", "/api/orders/export")}
+    assert _required(result) == {"GET /api/orders"}
+    assert _anonymous(result) == set()
+
+
+def test_area_token_and_multiple_class_routes(tmp_path: Path) -> None:
+    (tmp_path / "ReportsController.cs").write_text(
+        'using Microsoft.AspNetCore.Mvc;\n'
+        '[Area("Admin")]\n'
+        '[Route("[area]/[controller]")]\n'
+        '[Route("legacy/reports")]\n'
+        'public class ReportsController : Controller\n'
+        '{\n'
+        '    [HttpGet("{id}")]\n'
+        '    public IActionResult Show(int id) => View();\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _pairs(result) == {("GET", "/Admin/Reports/{id}"), ("GET", "/legacy/reports/{id}")}
+
+
+_PROGRAM = (
+    'using Microsoft.AspNetCore.Builder;\n'
+    'var builder = WebApplication.CreateBuilder(args);\n'
+    'var app = builder.Build();\n'
+    '\n'
+    'var api = app.MapGroup("/api");\n'
+    'var v2 = api.MapGroup("/v2")\n'
+    '    .RequireAuthorization();\n'
+    'v2.MapGet("/orders/{id}", (int id) => Results.Ok());\n'
+    'v2.MapPost("/login", () => Results.Ok()).AllowAnonymous();\n'
+    'api.MapGet("ping", () => "pong");\n'
+    'api.MapDelete("/items/{id}", (int id) => Results.Ok())\n'
+    '   .WithName("DeleteItem")\n'
+    '   .RequireAuthorization("Admin");\n'
+    'app.MapGroup("/inline").MapPut("/x", () => Results.Ok());\n'
+    'app.MapGet("/me", [Authorize] (ClaimsPrincipal u) => u.Identity!.Name);\n'
+    'var admin = app.MapGroup("/admin");\n'
+    'admin.MapGet("/stats", () => Results.Ok());\n'
+    'admin.RequireAuthorization();\n'
+    'app.MapHub<ChatHub>("/chat");\n'
+    'app.MapGrpcService<GreeterService>();\n'
+    'app.MapControllerRoute(name: "default", pattern: "{controller=Home}/{action=Index}/{id?}");\n'
+    'app.Run();\n'
+)
+
+
+def test_minimal_api_nested_map_group_prefixes(tmp_path: Path) -> None:
+    (tmp_path / "Program.cs").write_text(_PROGRAM, encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _pairs(result) == {
+        ("GET", "/api/v2/orders/{id}"),
+        ("POST", "/api/v2/login"),
+        ("GET", "/api/ping"),
+        ("DELETE", "/api/items/{id}"),
+        ("PUT", "/inline/x"),
+        ("GET", "/me"),
+        ("GET", "/admin/stats"),
+        ("ANY", "/chat"),
+        ("ANY", "/{controller=Home}/{action=Index}/{id?}"),
+    }
+    lines = {(r.method, r.path): r.line for r in result.routes}
+    assert lines[("GET", "/api/v2/orders/{id}")] == 8
+    protocols = {h.hint for h in result.protocol_hints}
+    assert {"signalr_hub:ChatHub", "grpc_service:GreeterService"} <= protocols
+
+
+def test_minimal_api_effective_auth(tmp_path: Path) -> None:
+    (tmp_path / "Program.cs").write_text(_PROGRAM, encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _required(result) == {
+        "GET /api/v2/orders/{id}",   # group .RequireAuthorization()
+        "DELETE /api/items/{id}",    # endpoint .RequireAuthorization("Admin")
+        "GET /me",                   # lambda [Authorize]
+        "GET /admin/stats",          # admin.RequireAuthorization() after MapGet
+    }
+    assert _anonymous(result) == {"POST /api/v2/login"}  # .AllowAnonymous() beats the group
+
+
+def test_map_controllers_require_authorization_applies_to_other_files(tmp_path: Path) -> None:
+    (tmp_path / "Program.cs").write_text(
+        'var app = WebApplication.CreateBuilder(args).Build();\n'
+        'app.MapControllers().RequireAuthorization();\n'
+        'app.MapGet("/open", () => "ok");\n'
+        'app.Run();\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "UsersController.cs").write_text(_USERS_CONTROLLER.replace("[Authorize]\npublic class", "public class"), encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert "GET /api/Users/{id}" in _required(result)
+    assert "GET /helper" in _required(result)
+    assert "GET /open" not in _required(result)  # minimal APIs aren't controllers
+    assert _anonymous(result) == {"POST /public/signup", "GET /health"}
+
+
+def test_fallback_policy_requires_auth_for_unmarked_routes(tmp_path: Path) -> None:
+    (tmp_path / "Program.cs").write_text(
+        'var builder = WebApplication.CreateBuilder(args);\n'
+        'builder.Services.AddAuthorization(options =>\n'
+        '{\n'
+        '    options.FallbackPolicy = new AuthorizationPolicyBuilder()\n'
+        '        .RequireAuthenticatedUser()\n'
+        '        .Build();\n'
+        '});\n'
+        'var app = builder.Build();\n'
+        'app.MapGet("/data", () => "x");\n'
+        'app.MapGet("/public", () => "x").AllowAnonymous();\n'
+        'app.Run();\n',
+        encoding="utf-8",
+    )
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _required(result) == {"GET /data"}
+    assert _anonymous(result) == {"GET /public"}
+
+
+def test_razor_pages_routes(tmp_path: Path) -> None:
+    pages = tmp_path / "Pages"
+    (pages / "Admin").mkdir(parents=True)
+    (pages / "Index.cshtml").write_text('@page\n<h1>Home</h1>\n', encoding="utf-8")
+    (pages / "Admin" / "Edit.cshtml").write_text('@page "{id:int}"\n@model EditModel\n', encoding="utf-8")
+    (pages / "Shared").mkdir()
+    (pages / "Shared" / "_Layout.cshtml").write_text('<html>@RenderBody()</html>\n', encoding="utf-8")
+    area = tmp_path / "Areas" / "Identity" / "Pages" / "Account"
+    area.mkdir(parents=True)
+    (area / "Login.cshtml").write_text('@page\n', encoding="utf-8")
+    (tmp_path / "Pages" / "About.cshtml").write_text('@page "/about-us"\n', encoding="utf-8")
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert _pairs(result) == {
+        ("ANY", "/"),
+        ("ANY", "/Admin/Edit/{id:int}"),
+        ("ANY", "/Identity/Account/Login"),
+        ("ANY", "/about-us"),
+    }
+
+
+def test_all_emitted_paths_start_with_slash(tmp_path: Path) -> None:
+    (tmp_path / "UsersController.cs").write_text(_USERS_CONTROLLER, encoding="utf-8")
+    (tmp_path / "Program.cs").write_text(_PROGRAM, encoding="utf-8")
+    (tmp_path / "Legacy.cs").write_text(
+        'app.MapGet("no-slash", () => "x");\n'
+        'app.MapMethods("also-none", new[] { "GET" }, () => "x");\n',
+        encoding="utf-8",
+    )
+    result = DotnetAnalyzer().analyze(tmp_path)
+    assert result.routes
+    assert all(r.path.startswith("/") for r in result.routes), [r.path for r in result.routes]
+    assert ("GET", "/no-slash") in _pairs(result)
+
+
+def test_appsettings_connection_string_password_is_a_secret_without_its_key_name(tmp_path: Path) -> None:
+    (tmp_path / "appsettings.json").write_text(
+        '{\n'
+        '  // comments are allowed in .NET config\n'
+        '  "ConnectionStrings": {\n'
+        '    "Default": "Server=db;Database=app;User Id=sa;Password=Hunter2!;",\n'
+        '    "Cache": "localhost:6379",\n'
+        '    "Placeholder": "Server=db;Password={DB_PASSWORD}"\n'
+        '  },\n'
+        '  "Logging": { "LogLevel": { "Default": "Information" } }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "appsettings.Production.json").write_text(
+        '{ "ConnectionStrings": { "Main": "Host=pg;Pwd=s3cret" } }\n', encoding="utf-8"
+    )
+    (tmp_path / "other.json").write_text(
+        '{ "ConnectionStrings": { "X": "Password=nope" } }\n', encoding="utf-8"
+    )
+    result = DotnetAnalyzer().analyze(tmp_path)
+    secrets = [(s.name, s.file, s.line) for s in result.secret_hints]
+    assert secrets == [
+        ("connection_string_password", "appsettings.Production.json", 1),
+        ("connection_string_password", "appsettings.json", 4),
+    ]
+    assert not any(s.name in {"Default", "Main", "Cache"} for s in result.secret_hints)
+    assert all("Hunter2" not in (s.evidence_text or "") for s in result.secret_hints)
+    assert all(s.kind == "config_literal" for s in result.secret_hints)

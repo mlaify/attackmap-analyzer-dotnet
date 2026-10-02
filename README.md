@@ -12,11 +12,11 @@ C# / .NET (ASP.NET Core) ecosystem analyzer for [AttackMap](https://github.com/m
 
 This analyzer extracts structured signals from .NET solutions and projects:
 
-- **Web frameworks** — ASP.NET Core minimal APIs (`app.MapGet`, `app.MapPost`, `app.MapMethods`), attribute routing on controllers (`[HttpGet]`, `[HttpPost]`, with class-level `[Route]` prefix joining and `[controller]` token substitution)
+- **Web frameworks** — ASP.NET Core minimal APIs (`app.MapGet`, `app.MapPost`, `app.MapMethods`, nested `MapGroup` prefixes), attribute routing on controllers (`[HttpGet]`, `[HttpPost]`, `[Route]`, `[AcceptVerbs]`, with class-level `[Route]` prefix joining and `[controller]`/`[action]`/`[area]` token substitution), `MapHub<T>`, `MapControllerRoute`, Razor Pages `@page`; `MapGrpcService<T>` as a protocol hint
 - **Databases** — Entity Framework Core (`UseSqlServer` / `UseNpgsql` / `UseMySql` / `UseSqlite`), Dapper, System.Data.SqlClient / Microsoft.Data.SqlClient, Npgsql, MySql.Data / MySqlConnector, MongoDB.Driver, StackExchange.Redis, AWS SDK (S3, DynamoDB)
-- **Auth packages** — `AddJwtBearer` (Microsoft.AspNetCore.Authentication.JwtBearer), `AddOpenIdConnect`, ASP.NET Identity (`UserManager`, `SignInManager`, `IdentityUser`, `PasswordHasher`), `[Authorize]` attribute, Duende IdentityServer, BCrypt.Net, Argon2
+- **Auth packages** — `AddJwtBearer` (Microsoft.AspNetCore.Authentication.JwtBearer), `AddOpenIdConnect`, ASP.NET Identity (`UserManager`, `SignInManager`, `IdentityUser`, `PasswordHasher`), per-route `[Authorize]` / `[AllowAnonymous]` / `.RequireAuthorization()` / `.AllowAnonymous()`, Duende IdentityServer, BCrypt.Net, Argon2
 - **HTTP clients (external calls)** — `HttpClient.GetAsync` / `PostAsync` / `SendAsync`, `HttpRequestMessage`, `RestClient` (RestSharp), `new Uri(...)`
-- **Secrets** — `Environment.GetEnvironmentVariable("...")`, `IConfiguration["..."]` / `Configuration["..."]` / `builder.Configuration["..."]` with secret-shaped keys, `GetConnectionString(...)`
+- **Secrets** — `Environment.GetEnvironmentVariable("...")`, `IConfiguration["..."]` / `Configuration["..."]` / `builder.Configuration["..."]` with secret-shaped keys, literal `Password=` in `appsettings*.json` `ConnectionStrings`
 - **Service hints** — `<RootNamespace>` and `<AssemblyName>` from `.csproj`
 
 All emissions populate AttackMap's Signal v2 fields (line numbers, evidence snippets, confidence scores) so downstream insights can cite `path/to/file.cs:NN`.
@@ -48,11 +48,12 @@ attackmap analyze /path/to/dotnet/repo --module dotnet
 
 ## Coverage notes
 
-- **Class-level `[Route]` prefix joining**: a controller annotated with `[Route("api/[controller]")]` or `[Route("api/orders")]` causes its method-level `[HttpGet("{id:int}")]` to emit as `api/Orders/{id:int}` (with `[controller]` substituted with the class name minus the `Controller` suffix). Multiple controllers per file are tracked correctly.
-- **Minimal API + controller routing in the same project**: both extractors run on every `.cs` file. The minimal-API regex looks for `app.Map*("...", handler)`; the controller regex looks for `[HttpX("...")]` attributes. They don't overlap.
-- **Connection strings as secrets**: `GetConnectionString("DefaultConnection")` is treated as a secret reference because the connection string itself is a credential. The named key (`DefaultConnection`) is stored as the secret name.
+- **Route templates** follow ASP.NET semantics: a controller annotated with `[Route("api/[controller]")]` causes its `[HttpGet("{id:int}", Name = "GetUser")]` action to emit as `/api/Orders/{id:int}`. An action template starting with `/` or `~/` is absolute and replaces the controller prefix. `[controller]` (class name minus `Controller`), `[action]` (method name minus `Async`) and `[area]` (`[Area("...")]`) are substituted case-insensitively. A class prefix applies only inside that class's body. Every emitted path starts with `/`.
+- **Minimal API groups**: `var api = app.MapGroup("/api"); var v2 = api.MapGroup("/v2"); v2.MapGet("/orders/{id}", ...)` emits `/api/v2/orders/{id}`. Inline chains (`app.MapGroup("/x").MapGet("/y", ...)`) work too. A group built in another file or by a custom extension method isn't followed.
+- **Per-route auth**: each route's effective state is computed. `[AllowAnonymous]` (attribute) or `.AllowAnonymous()` (minimal API, on the endpoint or any enclosing group) wins over `[Authorize]` / `.RequireAuthorization()`, as in ASP.NET. An authorization fallback policy, or `MapControllers().RequireAuthorization()`, makes unmarked routes require auth. A route that requires auth gets an `aspnet_authorize:<METHOD> <path>` auth hint on its own line; an explicitly anonymous route gets an `aspnet_allow_anonymous:<METHOD> <path>` entrypoint hint and no auth hint. Core attributes auth hints to routes by a ±40-line window until `Route` carries an auth field ([mlaify/AttackMap#256](https://github.com/mlaify/AttackMap/issues/256)), so in a compact controller a neighbor's hint can still show up on an anonymous route. `[Authorize]` inherited from a base controller class isn't followed.
+- **Connection strings**: `GetConnectionString("DefaultConnection")` names a connection string, so it isn't reported as a secret. A literal `Password=`/`Pwd=` inside an `appsettings*.json` `ConnectionStrings` entry is reported as `connection_string_password` (`kind="config_literal"`); the evidence names the entry, never the value.
 - **F# (.fs) projects** are detected via `.fsproj` but route extraction is not yet implemented (Giraffe / Saturn).
-- **Razor Pages** (`@page` directives in `.cshtml` / `.razor`) are not yet covered. Most security-critical APIs use minimal APIs or controllers.
+- **Razor Pages**: `@page` in a `.cshtml` file emits an `ANY` route from the file's path under `Pages/` (or `Areas/<Area>/Pages/`), with `Index` mapped to its folder and an optional `@page "template"` appended (or used as-is when it starts with `/`). Page auth conventions (`AuthorizeFolder`, `[Authorize]` on the PageModel) aren't read yet. Blazor `.razor` components aren't covered.
 
 ## License
 
