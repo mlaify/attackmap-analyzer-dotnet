@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -418,3 +419,48 @@ def test_full_aspnetcore_service_signal_set(tmp_path: Path) -> None:
     assert any(h.hint == "namespace:Demo" for h in result.service_hints)
 
     assert all(r.line is not None for r in result.routes)
+
+
+# ---------- Repo walking (mlaify/AttackMap#253) ----------
+
+
+def _write_minimal_api(repo: Path) -> Path:
+    repo.mkdir(parents=True, exist_ok=True)
+    program = repo / "Program.cs"
+    program.write_text(
+        'using Microsoft.AspNetCore.Builder;\n'
+        '\n'
+        'var builder = WebApplication.CreateBuilder(args);\n'
+        'var app = builder.Build();\n'
+        '\n'
+        'app.MapGet("/hello", () => "world");\n'
+        '\n'
+        'app.Run();\n',
+        encoding="utf-8",
+    )
+    return program
+
+
+@pytest.mark.parametrize("parents", [("build", "out"), ("bin", "obj")])
+def test_repo_under_skip_dir_names_is_still_analyzed(tmp_path: Path, parents: tuple[str, str]) -> None:
+    # These are skip dirs; they must only count inside the repo.
+    repo = tmp_path.joinpath(*parents, "repo")
+    _write_minimal_api(repo)
+    analyzer = DotnetAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert ("/hello", "GET") in {(r.path, r.method) for r in result.routes}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    target = _write_minimal_api(tmp_path / "outside")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "Linked.cs").symlink_to(target)
+    analyzer = DotnetAnalyzer()
+    assert analyzer.detect(repo) is False
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 0
+    assert result.routes == []
