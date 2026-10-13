@@ -37,21 +37,25 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
     ProtocolHint,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
 from .routes import ANONYMOUS, REQUIRED, UNKNOWN, RouteSpec, extract_cs_routes, extract_razor_page
 
 CODE_SUFFIXES = {".cs"}
