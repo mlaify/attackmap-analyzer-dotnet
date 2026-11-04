@@ -190,7 +190,7 @@ class DotnetAnalyzer:
     metadata = AnalyzerMetadata(
         name="dotnet",
         display_name="C# / .NET Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="ASP.NET Core analyzer covering minimal APIs, attribute routing, EF Core, Identity, and JwtBearer.",
         scope=".NET solutions and projects (.csproj, .sln). Detects ASP.NET Core minimal APIs and controllers.",
         targets=["dotnet", "csharp", "aspnetcore"],

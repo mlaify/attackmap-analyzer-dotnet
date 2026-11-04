@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Added
 
 - Routes carry their effective auth in the core contract (AttackMap#256): `Route.auth` (`required` / `anonymous` / `unknown`), `guards` and `guard_evidence`. AttackMap ≥ 0.6 uses them instead of its ±40-line auth-hint window, so an `[AllowAnonymous]` action no longer inherits its neighbour's `[Authorize]`. The `aspnet_authorize:*` / `aspnet_allow_anonymous:*` hints are kept for one release for older cores, which ignore the new fields.
@@ -79,5 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-dotnet/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-dotnet/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mlaify/attackmap-analyzer-dotnet/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-dotnet/releases/tag/v0.1.0
