@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-dotnet"
-version = "0.2.0"
+version = "0.2.1"
 description = "C# / .NET (ASP.NET Core) ecosystem analyzer plugin for AttackMap (minimal APIs, attribute routing, EF Core, Identity, JwtBearer)."
 readme = "README.md"
 requires-python = ">=3.11"
