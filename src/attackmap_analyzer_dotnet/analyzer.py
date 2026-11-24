@@ -38,6 +38,7 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -190,7 +191,8 @@ class DotnetAnalyzer:
     metadata = AnalyzerMetadata(
         name="dotnet",
         display_name="C# / .NET Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-dotnet", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="ASP.NET Core analyzer covering minimal APIs, attribute routing, EF Core, Identity, and JwtBearer.",
         scope=".NET solutions and projects (.csproj, .sln). Detects ASP.NET Core minimal APIs and controllers.",
         targets=["dotnet", "csharp", "aspnetcore"],
