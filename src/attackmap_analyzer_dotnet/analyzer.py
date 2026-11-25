@@ -191,7 +191,7 @@ class DotnetAnalyzer:
     metadata = AnalyzerMetadata(
         name="dotnet",
         display_name="C# / .NET Analyzer",
-        version=plugin_version("attackmap-analyzer-dotnet", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-dotnet", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="ASP.NET Core analyzer covering minimal APIs, attribute routing, EF Core, Identity, and JwtBearer.",
         scope=".NET solutions and projects (.csproj, .sln). Detects ASP.NET Core minimal APIs and controllers.",
